@@ -153,6 +153,65 @@ class CarrierExclusionResult(BaseModel):
     )
 
 
+# ------------------------------------------------ 载频漂移风险评估
+
+class CarrierTolerance(BaseModel):
+    """单个载频的漂移容差条目。"""
+
+    carrier_hz: int = Field(..., gt=0, description="载频，整数 Hz")
+    tolerance_hz: int = Field(
+        ..., ge=0, le=1_000_000, description="漂移容差：0～1000000 的整数 Hz"
+    )
+
+
+class DriftRiskRequest(BaseModel):
+    """漂移风险评估请求：为该站点每个载频给出唯一且完整的容差映射。"""
+
+    tolerances: list[CarrierTolerance] = Field(
+        ...,
+        min_length=1,
+        description="每个载频一条容差条目；须与站点载频一一对应，不得缺失、重复或多余",
+    )
+
+    @field_validator("tolerances")
+    @classmethod
+    def _check_unique_carriers(cls, v: list[CarrierTolerance]) -> list[CarrierTolerance]:
+        carriers = [t.carrier_hz for t in v]
+        if len(set(carriers)) != len(carriers):
+            raise ValueError("duplicate carrier_hz in tolerances")
+        return v
+
+
+class DriftRiskEntry(BaseModel):
+    """一个有序来源组合在独立漂移下的潜在互调风险。"""
+
+    source: SourcePair = Field(
+        ..., description="有序来源组合 (fa_hz, fb_hz)，产物为 2*fa_hz - fb_hz"
+    )
+    nominal_freq_hz: int = Field(..., description="标称产物频率 2*fa_hz - fb_hz，整数 Hz")
+    reachable_start_hz: int = Field(..., description="漂移下产物可达区间起点（含），整数 Hz")
+    reachable_end_hz: int = Field(..., description="漂移下产物可达区间终点（含），整数 Hz")
+    min_distance_hz: int = Field(
+        ..., description="全部漂移组合下产物到任一载频或保护频段的最小可能距离，整数 Hz"
+    )
+    hits: list[HitObject] = Field(
+        ...,
+        description="取得该最小距离的全部并列命中对象：载频升序在前，"
+        "保护频段按 (start_hz, end_hz) 升序在后",
+    )
+
+
+class DriftRiskResult(BaseModel):
+    """漂移风险评估结果：仅含最小可能距离严格小于保护间隔的来源；不保存分析。"""
+
+    site_id: int
+    guard_interval_hz: int = Field(..., description="判定阈值：站点配置的保护间隔，整数 Hz")
+    risk_count: int = Field(..., description="风险来源数量，等于 risks 的长度")
+    risks: list[DriftRiskEntry] = Field(
+        ..., description="风险来源列表，按 (标称频率, fa_hz, fb_hz) 升序，稳定可复现"
+    )
+
+
 # ------------------------------------------------ 跨站点冲突检测
 
 class CrossSiteConflictsRequest(BaseModel):

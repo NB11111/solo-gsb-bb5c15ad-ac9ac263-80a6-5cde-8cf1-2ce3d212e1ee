@@ -8,6 +8,7 @@ from .schemas import (
     ConflictCluster,
     ConflictPair,
     ConflictProduct,
+    DriftRiskEntry,
     ExclusionRange,
     GuardBand,
     HitObject,
@@ -687,6 +688,74 @@ def carrier_exclusion_ranges(
         else:
             merged.append(ExclusionRange(start_hz=lo, end_hz=hi))
     return merged
+
+
+def drift_risk_assessment(
+    carriers_hz: list[int],
+    tolerances_hz: dict[int, int],
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+) -> list[DriftRiskEntry]:
+    """独立载频漂移下的全频域潜在互调风险评估（不执行也不保存分析）。
+
+    每个载频 c 的实际频率为 c + δ_c，δ_c ∈ [-t_c, +t_c]，不同载频的漂移
+    互相独立，但同一载频的漂移是共享变量。对每个有序来源 (fa, fb)
+    （fa != fb），产物 2*(fa+δ_a) - (fb+δ_b) 的可达区间为
+    [2fa-fb - (2t_a+t_b), 2fa-fb + (2t_a+t_b)]（δ_a、δ_b 各出现一次，
+    区间精确无放大）。枚举全部有序来源，不按扫描范围过滤（全频域）。
+
+    最小可能距离按对象分别计算后取最小：
+    - 漂移载频 c：差值 (2fa-fb-c) + 2δ_a - δ_b - δ_c 中同一漂移变量
+      合并线性系数（c==fa 时 δ_a 的系数为 2-1=1，c==fb 时 δ_b 为 -2），
+      可达半径为 Σ|系数|·t，最小距离 = max(0, |2fa-fb-c| - 半径)；
+      不把产物区间与载频区间当作独立区间重复放宽。
+    - 固定保护频段 [s, e]：可达区间 [lo, hi] 与频段的区间距离
+      max(s-hi, lo-e, 0)（重叠为 0）。
+
+    仅返回最小可能距离严格小于 guard_interval_hz 的来源；命中对象为取得
+    该最小距离的全部并列对象（载频升序在前，保护频段按 (start_hz, end_hz)
+    升序在后）。结果按 (标称频率, fa_hz, fb_hz) 升序排序，稳定可复现。
+    """
+    carriers = sorted(carriers_hz)
+    bands = sorted(guard_bands, key=lambda b: (b.start_hz, b.end_hz))
+    entries: list[DriftRiskEntry] = []
+    for fa in carriers:
+        t_a = tolerances_hz[fa]
+        for fb in carriers:
+            if fa == fb:
+                continue
+            t_b = tolerances_hz[fb]
+            nominal = 2 * fa - fb
+            spread = 2 * t_a + t_b
+            lo, hi = nominal - spread, nominal + spread
+
+            candidates: list[tuple[int, HitObject]] = []
+            for c in carriers:
+                # 差值 (nominal - c) + 2δ_a - δ_b - δ_c：同一漂移变量合并系数
+                coef = {fa: 2, fb: -1}
+                coef[c] = coef.get(c, 0) - 1
+                radius = sum(abs(k) * tolerances_hz[carrier] for carrier, k in coef.items())
+                distance = max(0, abs(nominal - c) - radius)
+                candidates.append((distance, HitObject(type="carrier", carrier_hz=c)))
+            for band in bands:
+                distance = max(band.start_hz - hi, lo - band.end_hz, 0)
+                candidates.append((distance, HitObject(type="guard_band", guard_band=band)))
+
+            min_distance = min(distance for distance, _ in candidates)
+            if min_distance >= guard_interval_hz:
+                continue
+            entries.append(
+                DriftRiskEntry(
+                    source=SourcePair(fa_hz=fa, fb_hz=fb),
+                    nominal_freq_hz=nominal,
+                    reachable_start_hz=lo,
+                    reachable_end_hz=hi,
+                    min_distance_hz=min_distance,
+                    hits=[hit for distance, hit in candidates if distance == min_distance],
+                )
+            )
+    entries.sort(key=lambda e: (e.nominal_freq_hz, e.source.fa_hz, e.source.fb_hz))
+    return entries
 
 
 def build_cross_site_conflicts(

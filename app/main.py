@@ -13,6 +13,7 @@ from .analysis import (
     build_mitigation_plan,
     build_risk_groups,
     carrier_exclusion_ranges,
+    drift_risk_assessment,
 )
 from .schemas import (
     AnalysisMeta,
@@ -20,6 +21,8 @@ from .schemas import (
     CarrierExclusionResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
+    DriftRiskRequest,
+    DriftRiskResult,
     MitigationPlan,
     RiskGroup,
     SiteAnalysisRef,
@@ -120,6 +123,57 @@ def get_carrier_exclusion_ranges(
         candidate_start_hz=candidate_start_hz,
         candidate_end_hz=candidate_end_hz,
         exclusion_ranges=ranges,
+    )
+
+
+@app.post(
+    "/sites/{site_id}/drift-risk",
+    response_model=DriftRiskResult,
+    tags=["sites"],
+    summary="载频独立漂移下的全频域潜在互调风险评估（不保存分析）",
+    description=(
+        "请求体须为该站点**每个载频**提供唯一且完整的漂移容差 tolerance_hz"
+        "（0～1000000 的整数 Hz；映射缺失、重复、多余或容差非法 → 422；"
+        "站点不存在 → 404）。把载频漂移建模为共享变量：对每个有序来源 "
+        "fa≠fb 计算 2fa−fb 的可达区间 [2fa−fb−(2t_a+t_b), 2fa−fb+(2t_a+t_b)]；"
+        "与漂移载频比较时合并同一变量的线性系数（c==fa 时 δ_a 的系数为 "
+        "2−1=1），与固定保护频段比较时按区间距离计算，不把相关区间当作独立"
+        "区间重复放宽。枚举全部有序来源（全频域，不按扫描范围过滤），仅返回"
+        "最小可能距离严格小于 guard_interval_hz 的来源，包含来源、标称频率、"
+        "可达区间、最小距离与全部并列命中对象，按 (标称频率, fa_hz, fb_hz) "
+        "升序排序。评估结果不保存。"
+    ),
+)
+def evaluate_drift_risk(site_id: int, payload: DriftRiskRequest) -> DriftRiskResult:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    provided = {t.carrier_hz: t.tolerance_hz for t in payload.tolerances}
+    expected = set(site.carriers_hz)
+    missing = sorted(expected - provided.keys())
+    extra = sorted(provided.keys() - expected)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(
+                "missing tolerance for carrier(s): " + ", ".join(map(str, missing))
+            )
+        if extra:
+            parts.append(
+                "tolerance for unknown carrier(s): " + ", ".join(map(str, extra))
+            )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "; ".join(parts))
+    risks = drift_risk_assessment(
+        carriers_hz=site.carriers_hz,
+        tolerances_hz=provided,
+        guard_bands=site.guard_bands,
+        guard_interval_hz=site.guard_interval_hz,
+    )
+    return DriftRiskResult(
+        site_id=site_id,
+        guard_interval_hz=site.guard_interval_hz,
+        risk_count=len(risks),
+        risks=risks,
     )
 
 

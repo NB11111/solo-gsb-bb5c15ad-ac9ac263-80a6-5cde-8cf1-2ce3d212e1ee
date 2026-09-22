@@ -107,6 +107,86 @@ docker compose up --build
 }
 ```
 
+## 载频漂移风险评估（drift risk）
+
+`POST /sites/{site_id}/drift-risk` 评估载频独立漂移下全频域的潜在互调风险，
+**不执行也不保存分析**。请求体须为该站点**每个载频**提供唯一且完整的漂移容差
+`tolerance_hz`（0～1000000 的整数 Hz；映射缺失、重复、多余或容差非法 → `422`；
+站点不存在 → `404`）。
+
+- **共享变量建模**：每个载频 `c` 的实际频率为 `c + δ_c`，`δ_c ∈ [−t_c, +t_c]`，
+  不同载频的漂移互相独立，但同一载频的漂移是共享变量。对每个有序来源
+  `fa ≠ fb`，产物 `2·(fa+δ_a) − (fb+δ_b)` 的可达区间为
+  `[2fa−fb − (2t_a+t_b), 2fa−fb + (2t_a+t_b)]`（每个变量只出现一次，区间精确）。
+- **最小可能距离**：枚举全部有序来源（全频域，不按扫描范围过滤），对每个来源
+  分别计算到各对象的最小可能距离后取最小——
+  - 与**漂移载频** `c` 比较：差值 `(2fa−fb−c) + 2δ_a − δ_b − δ_c` 中同一漂移
+    变量合并线性系数（`c==fa` 时 `δ_a` 的系数为 `2−1=1`，`c==fb` 时 `δ_b`
+    为 `−2`），可达半径为 `Σ|系数|·t`，最小距离
+    `= max(0, |2fa−fb−c| − 半径)`；不把产物区间与载频区间当作独立区间重复放宽。
+  - 与**固定保护频段** `[s, e]` 比较：可达区间 `[lo, hi]` 与频段的区间距离
+    `max(s−hi, lo−e, 0)`（重叠为 0）。
+- **返回内容**：仅最小可能距离严格小于 `guard_interval_hz` 的来源，含来源
+  `(fa_hz, fb_hz)`、标称频率、可达区间、最小距离与**全部并列命中对象**
+  （载频升序在前，保护频段按 `(起点, 终点)` 升序在后）；结果按
+  `(标称频率, fa_hz, fb_hz)` 升序排序，稳定可复现。
+
+请求与响应示例（载频 `[100, 300, 400]`、保护频段 `[480, 520]`、
+`guard_interval_hz=150`，容差 `{100: 10, 300: 20, 400: 30}`）：
+
+```bash
+curl -X POST http://localhost:8000/sites/1/drift-risk \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerances": [{"carrier_hz": 100, "tolerance_hz": 10},
+                       {"carrier_hz": 300, "tolerance_hz": 20},
+                       {"carrier_hz": 400, "tolerance_hz": 30}]}'
+```
+
+```json
+{
+  "site_id": 1,
+  "guard_interval_hz": 150,
+  "risk_count": 4,
+  "risks": [
+    {
+      "source": {"fa_hz": 300, "fb_hz": 400},
+      "nominal_freq_hz": 200,
+      "reachable_start_hz": 130,
+      "reachable_end_hz": 270,
+      "min_distance_hz": 20,
+      "hits": [{"type": "carrier", "carrier_hz": 100, "guard_band": null}]
+    },
+    {
+      "source": {"fa_hz": 300, "fb_hz": 100},
+      "nominal_freq_hz": 500,
+      "reachable_start_hz": 450,
+      "reachable_end_hz": 550,
+      "min_distance_hz": 0,
+      "hits": [{"type": "guard_band", "carrier_hz": null,
+                "guard_band": {"start_hz": 480, "end_hz": 520}}]
+    },
+    {
+      "source": {"fa_hz": 400, "fb_hz": 300},
+      "nominal_freq_hz": 500,
+      "reachable_start_hz": 420,
+      "reachable_end_hz": 580,
+      "min_distance_hz": 0,
+      "hits": [{"type": "guard_band", "carrier_hz": null,
+                "guard_band": {"start_hz": 480, "end_hz": 520}}]
+    },
+    {
+      "source": {"fa_hz": 400, "fb_hz": 100},
+      "nominal_freq_hz": 700,
+      "reachable_start_hz": 630,
+      "reachable_end_hz": 770,
+      "min_distance_hz": 110,
+      "hits": [{"type": "guard_band", "carrier_hz": null,
+                "guard_band": {"start_hz": 480, "end_hz": 520}}]
+    }
+  ]
+}
+```
+
 ## 跨站点冲突检测（cross-site conflicts）
 
 `POST /cross-site-conflicts` 接收 **2～8 个已保存站点 ID** 与非负整数频率容差
@@ -193,6 +273,7 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 | `GET` | `/sites` | 列出全部已保存方案 |
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
+| `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
@@ -231,6 +312,13 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 
 # 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
 curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
+
+# 载频漂移风险评估（每个载频给出容差，不保存分析）
+curl -X POST http://localhost:8000/sites/1/drift-risk \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerances": [{"carrier_hz": 100, "tolerance_hz": 10},
+                       {"carrier_hz": 300, "tolerance_hz": 20},
+                       {"carrier_hz": 400, "tolerance_hz": 30}]}'
 
 # 跨站点冲突检测（读取各站点最近一次分析，频率容差 10 Hz）
 curl -X POST http://localhost:8000/cross-site-conflicts \
@@ -304,7 +392,7 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（47 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、跨站点冲突检测）
+# 运行测试（57 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、载频漂移风险评估、跨站点冲突检测）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -322,7 +410,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、跨站点冲突配对与连通分量聚合
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
   database.py   # SQLite 建表与读写（单事务批量写入、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

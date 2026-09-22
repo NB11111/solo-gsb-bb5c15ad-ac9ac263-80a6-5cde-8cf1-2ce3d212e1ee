@@ -856,3 +856,327 @@ def test_cross_site_conflicts_eight_sites_limit(client):
     assert resp.status_code == 200, resp.text
     assert resp.json()["cluster_count"] == 0
     assert len(resp.json()["analyses"]) == 8
+
+
+# ---------------------------------------------------------------- 载频漂移风险评估
+
+def _drift_body(tolerances):
+    """tolerances: (carrier_hz, tolerance_hz) 列表 -> 请求体（保留重复条目）。"""
+    return {
+        "tolerances": [
+            {"carrier_hz": carrier, "tolerance_hz": tolerance}
+            for carrier, tolerance in tolerances
+        ]
+    }
+
+
+def test_drift_risk_merges_shared_drift_variables(client):
+    # 载频 [1000, 1300]，容差 {1000: 100, 1300: 50}，g=200。
+    # 来源 (1000,1300)：标称 700，可达区间 [450, 950]；与载频 1000（c==fa）
+    # 比较时 δ_a 系数合并为 2-1=1，半径 100+50=150，最小距离
+    # max(0, 300-150)=150（若误把产物区间与载频区间当独立区间，半径 350
+    # 会错得 0）；与载频 1300（c==fb）半径 2*100+2*50=300，距离 300。
+    # 来源 (1300,1000)：标称 1600，可达 [1400, 1800]，最小距离 150。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 1300], guard_interval_hz=200, scan_end_hz=100000,
+    ))
+    resp = client.post(
+        "/sites/1/drift-risk", json=_drift_body([(1000, 100), (1300, 50)])
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "guard_interval_hz": 200,
+        "risk_count": 2,
+        "risks": [
+            {
+                "source": {"fa_hz": 1000, "fb_hz": 1300},
+                "nominal_freq_hz": 700,
+                "reachable_start_hz": 450,
+                "reachable_end_hz": 950,
+                "min_distance_hz": 150,
+                "hits": [
+                    {"type": "carrier", "carrier_hz": 1000, "guard_band": None}
+                ],
+            },
+            {
+                "source": {"fa_hz": 1300, "fb_hz": 1000},
+                "nominal_freq_hz": 1600,
+                "reachable_start_hz": 1400,
+                "reachable_end_hz": 1800,
+                "min_distance_hz": 150,
+                "hits": [
+                    {"type": "carrier", "carrier_hz": 1300, "guard_band": None}
+                ],
+            },
+        ],
+    }
+
+
+def test_drift_risk_reports_all_tied_hits_and_ignores_scan_range(client):
+    # 零容差退化为静态距离。载频 [400, 600, 1000]，g=250，扫描范围仅
+    # [1, 300]：全频域评估不按扫描范围过滤，标称 800 的来源仍参与。
+    # (600,400)：标称 800，到载频 600 与 1000 的距离同为 200 -> 并列命中；
+    # (400,600) 与 (600,1000) 标称同为 200，按 (标称频率, fa, fb) 排序。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[400, 600, 1000], scan_end_hz=300, guard_interval_hz=250,
+    ))
+    resp = client.post(
+        "/sites/1/drift-risk", json=_drift_body([(400, 0), (600, 0), (1000, 0)])
+    )
+    assert resp.status_code == 200, resp.text
+    risks = resp.json()["risks"]
+    assert [
+        (r["nominal_freq_hz"], r["source"]["fa_hz"], r["source"]["fb_hz"])
+        for r in risks
+    ] == [(200, 400, 600), (200, 600, 1000), (800, 600, 400)]
+    # 零容差时可达区间退化为标称频率单点
+    assert risks[0]["reachable_start_hz"] == risks[0]["reachable_end_hz"] == 200
+    assert risks[0]["min_distance_hz"] == 200
+    assert risks[0]["hits"] == [
+        {"type": "carrier", "carrier_hz": 400, "guard_band": None}
+    ]
+    # 并列命中：载频 600 与 1000 距离同为 200，按载频升序列出
+    assert risks[2]["min_distance_hz"] == 200
+    assert risks[2]["hits"] == [
+        {"type": "carrier", "carrier_hz": 600, "guard_band": None},
+        {"type": "carrier", "carrier_hz": 1000, "guard_band": None},
+    ]
+
+
+def test_drift_risk_tied_hits_include_guard_band(client):
+    # 零容差，载频 [1000, 1400]，保护频段 [100, 200]，g=500。
+    # 来源 (1000,1400)：标称 600，到载频 1000 与保护频段 [100,200] 的距离
+    # 同为 400 -> 并列命中（载频在前，保护频段在后）
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 1400],
+        guard_bands=[{"start_hz": 100, "end_hz": 200}],
+        guard_interval_hz=500,
+        scan_end_hz=100000,
+    ))
+    resp = client.post(
+        "/sites/1/drift-risk", json=_drift_body([(1000, 0), (1400, 0)])
+    )
+    assert resp.status_code == 200, resp.text
+    risks = resp.json()["risks"]
+    assert [r["nominal_freq_hz"] for r in risks] == [600, 1800]
+    assert risks[0]["min_distance_hz"] == 400
+    assert risks[0]["hits"] == [
+        {"type": "carrier", "carrier_hz": 1000, "guard_band": None},
+        {
+            "type": "guard_band",
+            "carrier_hz": None,
+            "guard_band": {"start_hz": 100, "end_hz": 200},
+        },
+    ]
+    assert risks[1]["hits"] == [
+        {"type": "carrier", "carrier_hz": 1400, "guard_band": None}
+    ]
+
+
+def test_drift_risk_guard_band_interval_distance(client):
+    # 载频 [1000, 1300]，容差 {1000: 60, 1300: 0}，保护频段 [750, 900]，
+    # g=250。来源 (1000,1300)：标称 700，可达 [580, 820]，与频段重叠 ->
+    # 区间距离 0。来源 (1300,1000)：标称 1600，可达 [1540, 1660]，到频段
+    # 距离 640、到载频 1300（c==fa，半径 60）距离 240 -> 最小 240。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 1300],
+        guard_bands=[{"start_hz": 750, "end_hz": 900}],
+        guard_interval_hz=250,
+        scan_end_hz=100000,
+    ))
+    resp = client.post(
+        "/sites/1/drift-risk", json=_drift_body([(1000, 60), (1300, 0)])
+    )
+    assert resp.status_code == 200, resp.text
+    risks = resp.json()["risks"]
+    assert [r["nominal_freq_hz"] for r in risks] == [700, 1600]
+    assert risks[0]["min_distance_hz"] == 0
+    assert risks[0]["hits"] == [
+        {
+            "type": "guard_band",
+            "carrier_hz": None,
+            "guard_band": {"start_hz": 750, "end_hz": 900},
+        }
+    ]
+    assert risks[1]["min_distance_hz"] == 240
+    assert risks[1]["hits"] == [
+        {"type": "carrier", "carrier_hz": 1300, "guard_band": None}
+    ]
+
+
+def test_drift_risk_strict_guard_interval_threshold(client):
+    # 严格小于：最小可能距离恰好等于 guard_interval_hz 的来源不返回。
+    # 零容差，载频 [1000, 1400]：两个来源的最小距离都是 400。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 1400], guard_interval_hz=400, scan_end_hz=100000,
+    ))
+    body = _drift_body([(1000, 0), (1400, 0)])
+    resp = client.post("/sites/1/drift-risk", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["risks"] == []
+    assert resp.json()["risk_count"] == 0
+    # 保护间隔放宽到 401 时两个来源都进入结果
+    client.post("/sites", json=make_payload(
+        name="site-b",
+        carriers_hz=[1000, 1400],
+        guard_interval_hz=401,
+        scan_end_hz=100000,
+    ))
+    assert client.post("/sites/2/drift-risk", json=body).json()["risk_count"] == 2
+
+
+def test_drift_risk_full_response_example(client):
+    # README 示例：载频 [100, 300, 400]，保护频段 [480, 520]，g=150，
+    # 容差 {100: 10, 300: 20, 400: 30}
+    client.post("/sites", json=make_payload(
+        guard_bands=[{"start_hz": 480, "end_hz": 520}],
+    ))
+    resp = client.post(
+        "/sites/1/drift-risk",
+        json=_drift_body([(100, 10), (300, 20), (400, 30)]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "guard_interval_hz": 150,
+        "risk_count": 4,
+        "risks": [
+            {
+                "source": {"fa_hz": 300, "fb_hz": 400},
+                "nominal_freq_hz": 200,
+                "reachable_start_hz": 130,
+                "reachable_end_hz": 270,
+                "min_distance_hz": 20,
+                "hits": [
+                    {"type": "carrier", "carrier_hz": 100, "guard_band": None}
+                ],
+            },
+            {
+                "source": {"fa_hz": 300, "fb_hz": 100},
+                "nominal_freq_hz": 500,
+                "reachable_start_hz": 450,
+                "reachable_end_hz": 550,
+                "min_distance_hz": 0,
+                "hits": [
+                    {
+                        "type": "guard_band",
+                        "carrier_hz": None,
+                        "guard_band": {"start_hz": 480, "end_hz": 520},
+                    }
+                ],
+            },
+            {
+                "source": {"fa_hz": 400, "fb_hz": 300},
+                "nominal_freq_hz": 500,
+                "reachable_start_hz": 420,
+                "reachable_end_hz": 580,
+                "min_distance_hz": 0,
+                "hits": [
+                    {
+                        "type": "guard_band",
+                        "carrier_hz": None,
+                        "guard_band": {"start_hz": 480, "end_hz": 520},
+                    }
+                ],
+            },
+            {
+                "source": {"fa_hz": 400, "fb_hz": 100},
+                "nominal_freq_hz": 700,
+                "reachable_start_hz": 630,
+                "reachable_end_hz": 770,
+                "min_distance_hz": 110,
+                "hits": [
+                    {
+                        "type": "guard_band",
+                        "carrier_hz": None,
+                        "guard_band": {"start_hz": 480, "end_hz": 520},
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def test_drift_risk_404(client):
+    resp = client.post("/sites/999/drift-risk", json=_drift_body([(100, 0)]))
+    assert resp.status_code == 404
+
+
+def test_drift_risk_mapping_validation(client):
+    client.post("/sites", json=make_payload())  # 载频 [100, 300, 400]
+    url = "/sites/1/drift-risk"
+    # 边界值 0 与 1000000 合法
+    ok = _drift_body([(100, 0), (300, 10), (400, 1_000_000)])
+    assert client.post(url, json=ok).status_code == 200
+    # 缺失载频 400 / 多余载频 500 / 重复载频 100
+    assert client.post(url, json=_drift_body([(100, 0), (300, 0)])).status_code == 422
+    assert (
+        client.post(
+            url, json=_drift_body([(100, 0), (300, 0), (400, 0), (500, 0)])
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            url, json=_drift_body([(100, 0), (100, 1), (300, 0), (400, 0)])
+        ).status_code
+        == 422
+    )
+    # 容差越界 / 非整数 / 缺失
+    assert (
+        client.post(url, json=_drift_body([(100, -1), (300, 0), (400, 0)])).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            url, json=_drift_body([(100, 1_000_001), (300, 0), (400, 0)])
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(url, json=_drift_body([(100, 1.5), (300, 0), (400, 0)])).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            url, json=_drift_body([(100, "x"), (300, 0), (400, 0)])
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            url,
+            json={
+                "tolerances": [
+                    {"carrier_hz": 100},
+                    {"carrier_hz": 300, "tolerance_hz": 0},
+                    {"carrier_hz": 400, "tolerance_hz": 0},
+                ]
+            },
+        ).status_code
+        == 422
+    )
+    # 空映射 / 缺请求体
+    assert client.post(url, json={"tolerances": []}).status_code == 422
+    assert client.post(url).status_code == 422
+
+
+def test_drift_risk_does_not_save_analysis(client):
+    # 该端点不执行也不保存分析：调用后仍无分析记录
+    client.post("/sites", json=make_payload())
+    resp = client.post(
+        "/sites/1/drift-risk", json=_drift_body([(100, 10), (300, 20), (400, 30)])
+    )
+    assert resp.status_code == 200
+    assert client.get("/sites/1/analysis").status_code == 404
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_drift_risk_single_carrier_site_has_no_sources(client):
+    # 单载频站点没有有序来源组合：合法映射下返回空风险列表
+    client.post("/sites", json=make_payload(carriers_hz=[1000]))
+    resp = client.post("/sites/1/drift-risk", json=_drift_body([(1000, 100)]))
+    assert resp.status_code == 200
+    assert resp.json()["risk_count"] == 0
+    assert resp.json()["risks"] == []
