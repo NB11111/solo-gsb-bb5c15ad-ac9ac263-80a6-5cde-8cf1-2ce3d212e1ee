@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from . import database
 from .analysis import (
     analyze,
+    assess_drift_risk,
     build_cross_site_conflicts,
     build_mitigation_plan,
     build_risk_groups,
@@ -20,6 +21,8 @@ from .schemas import (
     CarrierExclusionResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
+    DriftRiskRequest,
+    DriftRiskResult,
     MitigationPlan,
     RiskGroup,
     SiteAnalysisRef,
@@ -120,6 +123,52 @@ def get_carrier_exclusion_ranges(
         candidate_start_hz=candidate_start_hz,
         candidate_end_hz=candidate_end_hz,
         exclusion_ranges=ranges,
+    )
+
+
+@app.post(
+    "/sites/{site_id}/drift-risk",
+    response_model=DriftRiskResult,
+    tags=["analysis"],
+    summary="评估独立载频漂移下全频域的潜在互调风险（不保存分析）",
+    description=(
+        "请求体给出该站点**每个载频唯一且完整**的漂移容差（0～1000000 的整数 Hz）。"
+        "每个载频独立漂移于 [标称 ± 容差]；对每个有序来源 (fa, fb)（fa ≠ fb）计算 "
+        "2·fa − fb 的可达区间，不做扫描范围过滤（全频域）。与漂移载频比较时合并同一"
+        "变量的线性系数（共享变量的距离按合并后的线性式求最小值，不把相关区间当作"
+        "独立区间重复放宽），与固定保护频段比较时按区间距离计算。仅返回最小可能距离"
+        "严格小于 guard_interval_hz 的来源，含来源、标称频率、可达区间、最小距离与"
+        "全部并列命中对象，按 (标称频率, fa, fb) 升序。站点不存在返回 404；映射缺失、"
+        "重复、多余或容差非法返回 422。评估结果不保存。"
+    ),
+)
+def assess_site_drift_risk(site_id: int, payload: DriftRiskRequest) -> DriftRiskResult:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    provided = {entry.carrier_hz for entry in payload.tolerances}
+    expected = set(site.carriers_hz)
+    missing = sorted(expected - provided)
+    extra = sorted(provided - expected)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing tolerance for carrier(s): " + ", ".join(map(str, missing)))
+        if extra:
+            parts.append("unknown carrier(s): " + ", ".join(map(str, extra)))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "; ".join(parts))
+    tolerances = {entry.carrier_hz: entry.tolerance_hz for entry in payload.tolerances}
+    risks = assess_drift_risk(
+        carriers_hz=site.carriers_hz,
+        tolerances_hz=tolerances,
+        guard_bands=site.guard_bands,
+        guard_interval_hz=site.guard_interval_hz,
+    )
+    return DriftRiskResult(
+        site_id=site_id,
+        guard_interval_hz=site.guard_interval_hz,
+        risk_count=len(risks),
+        risks=risks,
     )
 
 

@@ -238,3 +238,61 @@ class CrossSiteConflictsResponse(BaseModel):
     )
     cluster_count: int = Field(..., description="冲突簇数量，等于 clusters 的长度")
     clusters: list[ConflictCluster] = Field(..., description="冲突簇列表，cluster_id 从 1 连续编号")
+
+
+# ------------------------------------------------ 载频漂移风险
+
+class DriftToleranceEntry(BaseModel):
+    """单个载频的漂移容差：该载频可漂移范围为 [carrier_hz ± tolerance_hz]。"""
+
+    carrier_hz: int = Field(..., gt=0, description="载频（整数 Hz），必须为该站点的现有载频")
+    tolerance_hz: int = Field(
+        ..., ge=0, le=1_000_000, description="漂移容差（整数 Hz），取 0～1000000"
+    )
+
+
+class DriftRiskRequest(BaseModel):
+    """漂移风险评估请求：该站点每个载频唯一且完整的容差映射。
+
+    每个载频必须恰好出现一次：缺失、重复或多余（不属于该站点）都会被拒绝（422）。
+    """
+
+    tolerances: list[DriftToleranceEntry] = Field(
+        ..., min_length=1, description="每个载频一条容差记录，不得重复、缺失或多余"
+    )
+
+    @field_validator("tolerances")
+    @classmethod
+    def _check_unique_carriers(cls, v: list[DriftToleranceEntry]) -> list[DriftToleranceEntry]:
+        carriers = [entry.carrier_hz for entry in v]
+        if len(set(carriers)) != len(carriers):
+            raise ValueError("duplicate carrier_hz in tolerances")
+        return v
+
+
+class DriftRisk(BaseModel):
+    """一个来源组合在独立载频漂移下的潜在互调风险。"""
+
+    source: SourcePair = Field(..., description="来源组合：标称产物 = 2*fa_hz - fb_hz")
+    nominal_freq_hz: int = Field(..., description="标称产物频率 2*fa_hz - fb_hz，整数 Hz")
+    reachable_start_hz: int = Field(..., description="产物可达区间起点（含），整数 Hz")
+    reachable_end_hz: int = Field(..., description="产物可达区间终点（含），整数 Hz")
+    min_distance_hz: int = Field(
+        ..., description="漂移下产物到任何载频或保护频段的最小可能距离，整数 Hz"
+    )
+    hits: list[HitObject] = Field(
+        ...,
+        description="达到最小可能距离的全部并列命中对象：载频在前按频率升序，保护频段按起点升序",
+    )
+
+
+class DriftRiskResult(BaseModel):
+    """漂移风险评估结果（不保存分析）；无风险来源时 risks 为空列表。"""
+
+    site_id: int
+    guard_interval_hz: int = Field(..., description="判定所用的站点保护间隔")
+    risk_count: int = Field(..., description="风险来源数量，等于 risks 的长度")
+    risks: list[DriftRisk] = Field(
+        ...,
+        description="最小可能距离严格小于保护间隔的来源，按 (标称频率, fa_hz, fb_hz) 升序",
+    )
